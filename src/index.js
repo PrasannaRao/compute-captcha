@@ -1,82 +1,79 @@
-//! Default Compute@Edge template program.
+import * as cookie from "cookie";
 
-/// <reference types="@fastly/js-compute" />
+// This example uses Google reCAPTCHA V2.
+// To start using reCAPTCHA, you need to register your domain at https://www.google.com/recaptcha/admin
+// and get an API key pair. The key pair consists of a site key and a secret key.
+const SITEKEY = "6Lctc-IkAAAAAHntBvKvSpPxyRr3XQo9p59-xtIe";
+const SECRETKEY = "6Lctc-IkAAAAAM_Cei2xs-Wr85E43a3j4zUXQreo";
+const PROTECTED_CONTENT =
+  "<iframe src='https://developer.fastly.com/compute-welcome' style='border:0; position: absolute; top: 0; left: 0; width: 100%; height: 100%'></iframe>\n";
+const CAPTCHA_FORM = `
+<html>
+  <head>
+    <title>reCAPTCHA demo: Simple page</title>
+    <script src="https://www.google.com/recaptcha/api.js" async defer></script>
+  </head>
+  <body>
+    <form action="?captcha=true" method="POST">
+      <div class="g-recaptcha" data-sitekey="${SITEKEY}"></div>
+      <br/>
+      <input type="submit" value="Submit">
+    </form>
+  </body>
+</html>
+`;
 
-// import { CacheOverride } from "fastly:cache-override";
-// import { Logger } from "fastly:logger";
-import { includeBytes } from "fastly:experimental";
+async function handleCaptchaRequest(req) {
+  const body = await req.text();
+  // Extract the user's response token from the POST body
+  // and verify it with the reCAPTCHA API.
+  const captcha = body.split("=")[1];
+  const captchaURL = `https://www.google.com/recaptcha/api/siteverify?secret=${SECRETKEY}&response=${captcha}`;
+  const captchaReq = new Request(captchaURL);
+  const cacheOverride = new CacheOverride("pass");
 
-// Load a static file as a Uint8Array at compile time.
-// File path is relative to root of project, not to this file
-const welcomePage = includeBytes("./src/welcome-to-compute@edge.html");
+  console.log("Sending to CAPTCHA API to verify");
+  let res = await fetch(captchaReq, {
+    backend: "captcha_backend_name",
+    cacheOverride,
+  });
 
-// The entry point for your application.
-//
-// Use this fetch event listener to define your main request handling logic. It could be
-// used to route based on the request properties (such as method or path), send
-// the request to a backend, make completely new requests, and/or generate
-// synthetic responses.
-
-addEventListener("fetch", (event) => event.respondWith(handleRequest(event)));
+  const result = await res.json();
+  return result.success || false;
+}
 
 async function handleRequest(event) {
-  // Log service version
-  console.log("FASTLY_SERVICE_VERSION:", fastly.env.get('FASTLY_SERVICE_VERSION' || ''));
-  
-  // Get the client request.
   let req = event.request;
-
-  // Filter requests that have unexpected methods.
-  if (!["HEAD", "GET", "PURGE"].includes(req.method)) {
-    return new Response("This method is not allowed", {
-      status: 405,
-    });
-  }
-
   let url = new URL(req.url);
+  const isChallenge = url.searchParams.has("captcha");
 
-  // If request is to the `/` path...
-  if (url.pathname == "/") {
-    // Below are some common patterns for Compute@Edge services using JavaScript.
-    // Head to https://developer.fastly.com/learning/compute/javascript/ to discover more.
+  if (req.method === "POST" && isChallenge) {
+    const isPass = await handleCaptchaRequest(req);
+    if (isPass) {
+      // It's a pass! Set a cookie, so that this user is not challenged again within an hour.
+      // You would probably want to make this cookie harder to fake.
+      // If isPass is false, fall through to the remainder of the function and redisplay the CAPTCHA form.
+      url.searchParams.delete("captcha");
+      let headers = new Headers();
+      headers.set("Cache-Control", "private, no-store");
+      headers.set("Set-Cookie", "captchaAuth=1; path=/; max-age=3600");
+      headers.set("Location", url);
 
-    // Create a new request.
-    // let bereq = new Request("http://example.com");
-
-    // Add request headers.
-    // req.headers.set("X-Custom-Header", "Welcome to Compute@Edge!");
-    // req.headers.set(
-    //   "X-Another-Custom-Header",
-    //   "Recommended reading: https://developer.fastly.com/learning/compute"
-    // );
-
-    // Create a cache override.
-    // To use this, uncomment the import statement at the top of this file for CacheOverride.
-    // let cacheOverride = new CacheOverride("override", { ttl: 60 });
-
-    // Forward the request to a backend.
-    // let beresp = await fetch(req, {
-    //   backend: "backend_name",
-    //   cacheOverride,
-    // });
-
-    // Remove response headers.
-    // beresp.headers.delete("X-Another-Custom-Header");
-
-    // Log to a Fastly endpoint.
-    // To use this, uncomment the import statement at the top of this file for Logger.
-    // const logger = new Logger("my_endpoint");
-    // logger.log("Hello from the edge!");
-
-    // Send a default synthetic response.
-    return new Response(welcomePage, {
-      status: 200,
-      headers: new Headers({ "Content-Type": "text/html; charset=utf-8" }),
-    });
+      return new Response("", { status: 302, headers });
+    }
   }
 
-  // Catch all other requests and return a 404.
-  return new Response("The page you requested could not be found", {
-    status: 404,
-  });
+  let headers = new Headers();
+  headers.set("Content-Type", "text/html; charset=utf-8");
+
+  let body = CAPTCHA_FORM;
+  if (req.headers.has("Cookie")) {
+    const cookies = cookie.parse(req.headers.get("Cookie"));
+    if (cookies.captchaAuth === "1") {
+      body = PROTECTED_CONTENT;
+    }
+  }
+  return new Response(body, { status: 200, headers });
 }
+
+addEventListener("fetch", (event) => event.respondWith(handleRequest(event)));
